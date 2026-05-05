@@ -15,6 +15,17 @@
 /// Maximum size for a single RDMA operation in bytes (1 GiB).
 const MAX_RDMA_MSG_SIZE: usize = 1024 * 1024 * 1024;
 
+/// Signaling stride for chunked transfers (`put` / `get` > 1 GiB).
+///
+/// Every `SIGNAL_STRIDE`-th chunk is posted with `IBV_SEND_SIGNALED`, in
+/// addition to the final chunk, so a chunked transfer of N chunks produces
+/// `ceil(N / SIGNAL_STRIDE) + (1 if N % SIGNAL_STRIDE != 0 else 0)` CQ
+/// entries instead of a single final completion. This bounds the blast
+/// radius when an early chunk fails: the caller sees the error at (or
+/// shortly after) the failing chunk rather than only on the very last
+/// `IBV_WC_WR_FLUSH_ERR`. Set to 1 to signal every chunk.
+const SIGNAL_STRIDE: u64 = 8;
+
 use std::io::Error;
 use std::result::Result;
 use std::time::Duration;
@@ -531,6 +542,7 @@ impl IbvQueuePair {
         let mut remaining = total_size;
         let mut offset = 0;
         let mut wr_ids = Vec::new();
+        let mut chunk_idx: u64 = 0;
         while remaining > 0 {
             let chunk_size = std::cmp::min(remaining, MAX_RDMA_MSG_SIZE);
             let is_last_chunk = chunk_size >= remaining;
@@ -539,11 +551,13 @@ impl IbvQueuePair {
                     self.qp as *mut rdmaxcel_sys::rdmaxcel_qp,
                 )
             };
-            // Only signal the last chunk to reduce CQ pressure. For single-chunk
-            // transfers (the common case), every op is signaled. For multi-chunk
-            // (>1 GiB), only the final chunk generates a CQ entry — the caller
-            // waits on that single wr_id.
-            let signaled = is_last_chunk;
+            // Signal every SIGNAL_STRIDE-th chunk plus the last chunk. This
+            // reduces CQ pressure on chunked (>1 GiB) transfers while keeping
+            // the blast radius bounded: if chunk M fails, the error surfaces
+            // on the next signaled completion rather than only at the very
+            // end. For single-chunk transfers (the common case) every op is
+            // signaled.
+            let signaled = is_last_chunk || (chunk_idx % SIGNAL_STRIDE == 0);
             if signaled {
                 wr_ids.push(idx);
             }
@@ -565,6 +579,7 @@ impl IbvQueuePair {
 
             remaining -= chunk_size;
             offset += chunk_size;
+            chunk_idx += 1;
         }
 
         Ok(wr_ids)
@@ -692,6 +707,7 @@ impl IbvQueuePair {
         let mut remaining = total_size;
         let mut offset = 0;
         let mut wr_ids = Vec::new();
+        let mut chunk_idx: u64 = 0;
 
         while remaining > 0 {
             let chunk_size = std::cmp::min(remaining, MAX_RDMA_MSG_SIZE);
@@ -701,8 +717,8 @@ impl IbvQueuePair {
                     self.qp as *mut rdmaxcel_sys::rdmaxcel_qp,
                 )
             };
-            // Selective signaling: only signal the last chunk (see put() comment)
-            let signaled = is_last_chunk;
+            // Selective signaling with stride SIGNAL_STRIDE (see put() comment).
+            let signaled = is_last_chunk || (chunk_idx % SIGNAL_STRIDE == 0);
             if signaled {
                 wr_ids.push(idx);
             }
@@ -725,6 +741,7 @@ impl IbvQueuePair {
 
             remaining -= chunk_size;
             offset += chunk_size;
+            chunk_idx += 1;
         }
 
         Ok(wr_ids)
