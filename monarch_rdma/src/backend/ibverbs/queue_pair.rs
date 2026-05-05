@@ -15,8 +15,19 @@
 /// Maximum size for a single RDMA operation in bytes (1 GiB).
 const MAX_RDMA_MSG_SIZE: usize = 1024 * 1024 * 1024;
 
+/// Number of most-recent unsignaled WRs retained per QP for error triage.
+///
+/// When selective signaling suppresses CQ entries on chunked transfers, a
+/// single `IBV_WC_WR_FLUSH_ERR` on the final chunk hides the identity of
+/// the actual failing WR. The ring buffer keeps the last
+/// `UNSIGNALED_RING_CAPACITY` unsignaled WRs so that, on flush-error, the
+/// caller can correlate the flushed completion with the preceding chunks
+/// that never surfaced a completion.
+const UNSIGNALED_RING_CAPACITY: usize = 64;
+
 use std::io::Error;
 use std::result::Result;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -77,6 +88,82 @@ pub enum PollTarget {
     Recv,
 }
 
+/// A single entry in the per-QP unsignaled-WR ring buffer.
+///
+/// Records enough information to reconstruct which chunk of a chunked
+/// transfer was posted without `IBV_SEND_SIGNALED` and therefore did not
+/// produce a CQ entry of its own.
+#[derive(Debug, Clone, Copy)]
+struct UnsignaledEntry {
+    wr_id: u64,
+    local_addr: usize,
+    remote_addr: usize,
+    size: usize,
+    /// Nanoseconds since `UNIX_EPOCH` at enqueue time.
+    timestamp_nanos: u64,
+    op_type: IbvOperation,
+}
+
+impl std::fmt::Display for UnsignaledEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "wr_id={} op={:?} local=0x{:x} remote=0x{:x} size={} ts_ns={}",
+            self.wr_id,
+            self.op_type,
+            self.local_addr,
+            self.remote_addr,
+            self.size,
+            self.timestamp_nanos,
+        )
+    }
+}
+
+/// Fixed-capacity ring buffer of recent unsignaled WR metadata.
+///
+/// Stored as a leaked `Box<Mutex<UnsignaledRingBuffer>>` (pointer stashed as
+/// `usize` on `IbvQueuePair`) to preserve the existing `Clone/Serialize`
+/// semantics of the QP handle; clones of `IbvQueuePair` share the same
+/// ring buffer, matching the `qp` / `dv_qp` ownership pattern.
+#[derive(Debug)]
+struct UnsignaledRingBuffer {
+    entries: Vec<UnsignaledEntry>,
+    /// Index of the next slot to overwrite once `entries.len() == capacity`.
+    head: usize,
+    capacity: usize,
+}
+
+impl UnsignaledRingBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            head: 0,
+            capacity,
+        }
+    }
+
+    fn push(&mut self, entry: UnsignaledEntry) {
+        if self.entries.len() < self.capacity {
+            self.entries.push(entry);
+        } else {
+            self.entries[self.head] = entry;
+            self.head = (self.head + 1) % self.capacity;
+        }
+    }
+
+    /// Returns a snapshot of entries in insertion order (oldest first).
+    fn snapshot(&self) -> Vec<UnsignaledEntry> {
+        if self.entries.len() < self.capacity {
+            self.entries.clone()
+        } else {
+            let mut out = Vec::with_capacity(self.capacity);
+            out.extend_from_slice(&self.entries[self.head..]);
+            out.extend_from_slice(&self.entries[..self.head]);
+            out
+        }
+    }
+}
+
 /// An RDMA Queue Pair (QP) for communication between two endpoints.
 ///
 /// Encapsulates the send/receive queues, completion queues, and mlx5dv
@@ -105,6 +192,12 @@ pub struct IbvQueuePair {
     pub dv_send_cq: usize, // *mut rdmaxcel_sys::mlx5dv_cq,
     pub dv_recv_cq: usize, // *mut rdmaxcel_sys::mlx5dv_cq,
     context: usize,        // *mut rdmaxcel_sys::ibv_context,
+    /// Pointer to `Box<Mutex<UnsignaledRingBuffer>>` leaked at construction,
+    /// stored as `usize` to preserve the trivial `Clone`/`Serialize` shape
+    /// (clones share the same ring buffer, matching the `qp` pointer
+    /// ownership pattern). 0 if the QP was deserialized without a buffer.
+    #[serde(default)]
+    unsig_ring: usize,
     config: IbvConfig,
     is_efa: bool,
 }
@@ -113,6 +206,76 @@ wirevalue::register_type!(IbvQueuePair);
 impl IbvQueuePair {
     fn is_efa(&self) -> bool {
         self.is_efa
+    }
+
+    /// Allocates a leaked `Box<Mutex<UnsignaledRingBuffer>>` and returns its
+    /// raw address cast to `usize`. The buffer outlives the QP (never freed),
+    /// matching the existing ownership pattern for `qp` / `dv_qp`.
+    fn alloc_unsig_ring() -> usize {
+        let boxed = Box::new(Mutex::new(UnsignaledRingBuffer::new(
+            UNSIGNALED_RING_CAPACITY,
+        )));
+        Box::into_raw(boxed) as usize
+    }
+
+    /// Records an unsignaled WR in the per-QP ring buffer for later triage.
+    ///
+    /// No-op when `unsig_ring` is 0 (e.g. a QP reconstructed via
+    /// `Deserialize` without an associated buffer).
+    fn record_unsignaled(
+        &self,
+        wr_id: u64,
+        local_addr: usize,
+        remote_addr: usize,
+        size: usize,
+        op_type: IbvOperation,
+    ) {
+        if self.unsig_ring == 0 {
+            return;
+        }
+        let timestamp_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // SAFETY: `unsig_ring` was produced by `Box::into_raw` on a
+        // `Box<Mutex<UnsignaledRingBuffer>>` in `alloc_unsig_ring` and is
+        // never freed, so dereferencing is valid for the lifetime of the QP
+        // and all its clones.
+        let ring = unsafe { &*(self.unsig_ring as *const Mutex<UnsignaledRingBuffer>) };
+        if let Ok(mut guard) = ring.lock() {
+            guard.push(UnsignaledEntry {
+                wr_id,
+                local_addr,
+                remote_addr,
+                size,
+                timestamp_nanos,
+                op_type,
+            });
+        }
+    }
+
+    /// Returns a formatted snapshot of the unsignaled-WR ring buffer, or an
+    /// empty string when no buffer is attached or the lock is poisoned.
+    fn unsig_ring_snapshot(&self) -> String {
+        if self.unsig_ring == 0 {
+            return String::new();
+        }
+        // SAFETY: see `record_unsignaled`.
+        let ring = unsafe { &*(self.unsig_ring as *const Mutex<UnsignaledRingBuffer>) };
+        let Ok(guard) = ring.lock() else {
+            return String::from(" [unsignaled ring lock poisoned]");
+        };
+        let entries = guard.snapshot();
+        if entries.is_empty() {
+            return String::new();
+        }
+        let mut out = format!(" [unsignaled ring ({} entries, oldest first):", entries.len());
+        for e in &entries {
+            out.push_str("\n  ");
+            out.push_str(&e.to_string());
+        }
+        out.push(']');
+        out
     }
 
     /// Applies hardware initialization delay if this is the first operation since RTS.
@@ -194,6 +357,7 @@ impl IbvQueuePair {
                     dv_send_cq: 0,
                     dv_recv_cq: 0,
                     context: context as usize,
+                    unsig_ring: Self::alloc_unsig_ring(),
                     config,
                     is_efa: true,
                 });
@@ -232,6 +396,7 @@ impl IbvQueuePair {
                 dv_send_cq: dv_send_cq as usize,
                 dv_recv_cq: dv_recv_cq as usize,
                 context: context as usize,
+                unsig_ring: Self::alloc_unsig_ring(),
                 config,
                 is_efa: false,
             })
@@ -542,10 +707,20 @@ impl IbvQueuePair {
             // Only signal the last chunk to reduce CQ pressure. For single-chunk
             // transfers (the common case), every op is signaled. For multi-chunk
             // (>1 GiB), only the final chunk generates a CQ entry — the caller
-            // waits on that single wr_id.
+            // waits on that single wr_id. Each unsignaled chunk is recorded in
+            // the per-QP ring buffer so that, on a later `IBV_WC_WR_FLUSH_ERR`,
+            // the poll path can surface the preceding chunks for triage.
             let signaled = is_last_chunk;
             if signaled {
                 wr_ids.push(idx);
+            } else {
+                self.record_unsignaled(
+                    idx,
+                    lhandle.addr + offset,
+                    rhandle.addr + offset,
+                    chunk_size,
+                    IbvOperation::Write,
+                );
             }
             self.post_op(
                 lhandle.addr + offset,
@@ -705,6 +880,14 @@ impl IbvQueuePair {
             let signaled = is_last_chunk;
             if signaled {
                 wr_ids.push(idx);
+            } else {
+                self.record_unsignaled(
+                    idx,
+                    lhandle.addr + offset,
+                    rhandle.addr + offset,
+                    chunk_size,
+                    IbvOperation::Read,
+                );
             }
 
             self.post_op(
@@ -1000,12 +1183,23 @@ impl IbvQueuePair {
                     1 => {
                         if !wc.is_valid() {
                             if let Some((status, vendor_err)) = wc.error() {
+                                let ring_dump = if status
+                                    == rdmaxcel_sys::ibv_wc_status::IBV_WC_WR_FLUSH_ERR
+                                {
+                                    self.unsig_ring_snapshot()
+                                } else {
+                                    String::new()
+                                };
                                 return Err(PollCompletionError {
                                     status: Some(status),
                                     vendor_err: Some(vendor_err),
                                     message: format!(
-                                        "{} completion failed for wr_id={}: status={:?}, vendor_err={}",
-                                        cq_type, expected_wr_id, status, vendor_err,
+                                        "{} completion failed for wr_id={}: status={:?}, vendor_err={}{}",
+                                        cq_type,
+                                        expected_wr_id,
+                                        status,
+                                        vendor_err,
+                                        ring_dump,
                                     ),
                                 });
                             }
@@ -1021,11 +1215,18 @@ impl IbvQueuePair {
                                 .to_str()
                                 .unwrap_or("Unknown error");
                         if let Some((status, vendor_err)) = wc.error() {
+                            let ring_dump = if status
+                                == rdmaxcel_sys::ibv_wc_status::IBV_WC_WR_FLUSH_ERR
+                            {
+                                self.unsig_ring_snapshot()
+                            } else {
+                                String::new()
+                            };
                             return Err(PollCompletionError {
                                 status: Some(status),
                                 vendor_err: Some(vendor_err),
                                 message: format!(
-                                    "Failed to poll {} CQ for wr_id={}: {} [status={:?}, vendor_err={}, qp_num={}, byte_len={}]",
+                                    "Failed to poll {} CQ for wr_id={}: {} [status={:?}, vendor_err={}, qp_num={}, byte_len={}]{}",
                                     cq_type,
                                     expected_wr_id,
                                     error_msg,
@@ -1033,6 +1234,7 @@ impl IbvQueuePair {
                                     vendor_err,
                                     wc.qp_num,
                                     wc.len(),
+                                    ring_dump,
                                 ),
                             });
                         } else {
